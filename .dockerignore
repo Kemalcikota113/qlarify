@@ -1,0 +1,33 @@
+# Virtual environments
+venv/
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Version control
+.git/
+.gitignore
+
+# Environment / secrets
+.env
+.env.*
+*.key
+
+# Local data and outputs (can be large)
+data/
+outputs/
+runs/
+
+# HuggingFace local cache (datasets downloaded at runtime, not baked in)
+~/.cache/
+
+# Editor / OS artifacts
+.DS_Store
+.idea/
+.vscode/
+*.swp
