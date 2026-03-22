@@ -35,7 +35,7 @@ The combined score filters out bad demonstrations before they get multiplied acr
 
 ## Why did I build it?
 
-I wanted to put the needs of a potential ML/AI engineer at Qualia first. Qualia Studios is working on creating interfaces to train VLA models — systems that take camera observations, a language instruction, and output motor commands. That's a hard problem that requires a lot of high-quality demonstration data. Collecting that data is slow: getting a physical robot to perform a task correctly, recording it, and doing it again dozens or hundreds of times takes real human labor and machine time.
+I wanted to put the needs of a potential ML/AI engineer at Qualia first. Qualia Studios is working on creating interfaces to train VLA models, systems that take camera observations, a language instruction, and output motor commands. That's a hard problem that requires a lot of high-quality demonstration data. Collecting that data is slow: getting a physical robot to perform a task correctly, recording it, and doing it again dozens or hundreds of times takes real human labor and machine time.
 
 The engineers working on this are deep in the training infrastructure, they're thinking about compute scheduling, data pipelines, model architecture, hardware reliability. The last thing they need is a tool that adds friction. So the design principle here was: **build something that feels like a proper engineering tool, not a research notebook**.
 
@@ -43,7 +43,7 @@ In order to create that kind of tool with the level of reliability needed, i nee
 
 1. **Idempotency** - If you run Qlarify twice with the same output name, it detects the stale local cache and raises a clear error with instructions, rather than crashing with a cryptic `FileExistsError` buried in a stack trace. The `--overwrite` flag lets you explicitly clear it and start fresh.
 
-2. **`try/finally` around `finalize()`** - LeRobot v3 requires `finalize()` to be called before `push_to_hub()`, otherwise parquet file footers are never written and the remote dataset silently corrupts. If augmentation fails halfway through an episode, `finalize()` still runs. This is not a nice-to-have — a corrupted dataset upload on a multi-hour job is an expensive mistake.
+2. **`try/finally` around `finalize()`** - LeRobot v3 requires `finalize()` to be called before `push_to_hub()`, otherwise parquet file footers are never written and the remote dataset silently corrupts. If augmentation fails halfway through an episode, `finalize()` still runs. This is not a nice-to-have, a corrupted dataset upload on a multi-hour job is an expensive mistake.
 
 3. **`logging` over `print()`** - Every status message goes through Python's `logging` module with timestamps. On a long job running in a container or behind `nohup`, you want a log file you can inspect after the fact, not output that disappears.
 
@@ -59,7 +59,7 @@ These aren't flashy features. But on a training run that costs real compute, sav
 
 The first hour was spent reading, LeRobot v3 documentation, the library source, how the dataset format actually works at the parquet/video level. I'm not an ML researcher, so I wasn't going to out-paper anyone on augmentation theory. The bet I made was that the engineering quality of the tool would matter more than whether I implemented the latest technique from a 2024 ICLR submission.
 
-**Architecture first.** The core decision was to build a streaming CLI that mirrors the source dataset's schema automatically. `create_output_dataset()` reads `fps`, `features`, and `robot_type` directly from the source — so the same binary runs against ALOHA (14-DOF, 4 cameras, 50fps), PushT (2-DOF, 1 camera, 10fps), xArm (4-DOF, 1 camera), and Unitree H1 (19-DOF humanoid) with zero code changes. I dry-run validated all four during development.
+**Architecture first.** The core decision was to build a streaming CLI that mirrors the source dataset's schema automatically. `create_output_dataset()` reads `fps`, `features`, and `robot_type` directly from the source, so the same binary runs against ALOHA (14-DOF, 4 cameras, 50fps), PushT (2-DOF, 1 camera, 10fps), xArm (4-DOF, 1 camera), and Unitree H1 (19-DOF humanoid) with zero code changes. I dry-run validated all four during development.
 
 **CLI as the interface.** Everything is exposed as flags, strategies, multiplier, quality threshold, background style, speed range, noise scale. There's no config file to edit, no Python API to import. You pull the Docker image and run it. The `--dry-run` flag processes everything locally and skips the upload, which is how every iteration was tested before touching the Hub.
 
