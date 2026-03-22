@@ -20,17 +20,16 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 
 import torch
 from huggingface_hub import HfApi
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tqdm import tqdm
 
-from augmentations.quality import filter_episodes, score_episode
+from augmentations.quality import score_and_filter_episodes
 from augmentations.state import augment_action, augment_state
 from augmentations.video import augment_image, build_color_transform
-from utils.dataset import create_output_dataset, iter_episodes
+from utils.dataset import create_output_dataset, get_episode_bounds
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,88 +39,67 @@ def parse_args() -> argparse.Namespace:
         epilog=__doc__,
     )
     parser.add_argument(
-        "--source",
-        required=True,
+        "--source", required=True,
         help="Source dataset repo ID (e.g. lerobot/aloha_static_cups_open)",
     )
     parser.add_argument(
-        "--output",
-        required=True,
+        "--output", required=True,
         help="Output repo ID (e.g. your-hf-user/aloha_augmented)",
     )
     parser.add_argument(
-        "--strategies",
-        default="color",
+        "--strategies", default="color",
         help=(
             "Comma-separated augmentation strategies: "
-            "color (ColorJitter+noise), background (rembg replacement), "
-            "noise (state/action Gaussian noise). Default: color"
+            "color (ColorJitter+noise on video frames), "
+            "background (rembg background replacement), "
+            "noise (Gaussian noise on state/action). Default: color"
         ),
     )
     parser.add_argument(
-        "--multiplier",
-        type=int,
-        default=2,
-        help="How many augmented copies to create per episode. Default: 2",
+        "--multiplier", type=int, default=2,
+        help="Augmented copies to create per episode. Default: 2",
     )
     parser.add_argument(
-        "--filter-quality",
-        action="store_true",
-        help="Filter out low-quality episodes before augmenting.",
+        "--filter-quality", action="store_true",
+        help="Filter low-quality episodes by action smoothness before augmenting.",
     )
     parser.add_argument(
-        "--quality-threshold",
-        type=float,
-        default=0.3,
-        help="Minimum smoothness score to keep an episode [0, 1]. Default: 0.3",
+        "--quality-threshold", type=float, default=0.3,
+        help="Min smoothness score to keep [0,1]. Default: 0.3",
     )
     parser.add_argument(
-        "--max-episodes",
-        type=int,
-        default=None,
-        help="Maximum number of episodes to process (useful for quick tests).",
+        "--max-episodes", type=int, default=None,
+        help="Cap number of source episodes processed (useful for quick tests).",
     )
     parser.add_argument(
-        "--state-noise-scale",
-        type=float,
-        default=0.01,
+        "--state-noise-scale", type=float, default=0.01,
         help="Std dev of Gaussian noise on state observations. Default: 0.01",
     )
     parser.add_argument(
-        "--action-noise-scale",
-        type=float,
-        default=0.005,
+        "--action-noise-scale", type=float, default=0.005,
         help="Std dev of Gaussian noise on actions. Default: 0.005",
     )
     parser.add_argument(
-        "--private",
-        action="store_true",
+        "--private", action="store_true",
         help="Upload dataset as private on HuggingFace Hub.",
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Process data but skip upload. Useful for testing.",
+        "--dry-run", action="store_true",
+        help="Process data but skip upload. Useful for local testing.",
     )
     return parser.parse_args()
 
 
 def get_image_keys(dataset: LeRobotDataset) -> list[str]:
-    """Return all image/video feature keys from dataset schema."""
-    return [
-        key
-        for key, feat in dataset.meta.features.items()
-        if feat.get("dtype") in ("image", "video")
-    ]
+    return [k for k, f in dataset.meta.features.items() if f.get("dtype") in ("image", "video")]
 
 
-def get_state_keys(dataset: LeRobotDataset) -> list[str]:
-    """Return non-image, non-metadata feature keys (state, action, etc.)."""
-    skip = {"timestamp", "frame_index", "episode_index", "index", "task_index", "task"}
+def get_data_keys(dataset: LeRobotDataset) -> list[str]:
+    """Non-image feature keys that need to be passed to add_frame() explicitly."""
+    auto_generated = {"frame_index", "episode_index", "index", "task_index", "task", "timestamp"}
     return [
-        key
-        for key, feat in dataset.meta.features.items()
-        if feat.get("dtype") not in ("image", "video") and key not in skip
+        k for k, f in dataset.meta.features.items()
+        if f.get("dtype") not in ("image", "video") and k not in auto_generated
     ]
 
 
@@ -129,57 +107,59 @@ def augment_frame(
     frame: dict,
     strategies: set[str],
     image_keys: list[str],
-    state_keys: list[str],
+    data_keys: list[str],
     seed: int,
     color_transform,
     state_noise_scale: float,
     action_noise_scale: float,
+    source_features: dict,
 ) -> dict:
-    """Apply all requested augmentations to a single frame dict.
-
-    Returns a new frame dict ready to pass to dataset.add_frame().
-    """
+    """Return a new augmented frame dict ready for dataset.add_frame()."""
     result = {}
 
-    # Augment image features
+    # Video augmentation — augment_image works in CHW, add_frame expects HWC
     for key in image_keys:
-        if key in frame and isinstance(frame[key], torch.Tensor):
-            result[key] = augment_image(
-                frame[key],
-                strategies=strategies,
-                seed=seed,
-                color_transform=color_transform,
-            )
+        t = frame.get(key)
+        if isinstance(t, torch.Tensor):
+            # t is float32 CHW [0,1] from dataset[i]
+            aug = augment_image(t, strategies=strategies, seed=seed,
+                                color_transform=color_transform)
+            # Convert back to HWC uint8 as required by add_frame
+            hwc = (aug.permute(1, 2, 0) * 255).clamp(0, 255).byte()
+            result[key] = hwc
         else:
-            result[key] = frame[key]
+            result[key] = t
 
-    # Augment state/action features
-    for key in state_keys:
-        if key not in frame or not isinstance(frame[key], torch.Tensor):
-            result[key] = frame.get(key)
+    # State / action augmentation (only float tensors)
+    for key in data_keys:
+        t = frame.get(key)
+        if not isinstance(t, torch.Tensor):
+            result[key] = t
             continue
-        if "noise" in strategies:
-            if "action" in key:
-                result[key] = augment_action(frame[key], noise_scale=action_noise_scale, seed=seed)
-            else:
-                result[key] = augment_state(frame[key], noise_scale=state_noise_scale, seed=seed)
-        else:
-            result[key] = frame[key]
+        # Ensure shape matches feature schema (e.g. next.done loaded as () but schema wants (1,))
+        expected_shape = tuple(source_features.get(key, {}).get("shape", t.shape))
+        t_shaped = t.reshape(expected_shape) if t.shape != expected_shape else t
 
-    # Pass through metadata (task string is required by add_frame)
-    for key in ("task", "timestamp"):
-        if key in frame:
-            result[key] = frame[key]
+        if "noise" in strategies and t_shaped.is_floating_point():
+            if "action" in key:
+                result[key] = augment_action(t_shaped, noise_scale=action_noise_scale, seed=seed)
+            else:
+                result[key] = augment_state(t_shaped, noise_scale=state_noise_scale, seed=seed)
+        else:
+            result[key] = t_shaped
+
+    # task string is required; timestamp is auto-generated — do not pass it
+    if "task" in frame:
+        result["task"] = frame["task"]
 
     return result
 
 
 def run(args: argparse.Namespace) -> None:
     strategies = {s.strip().lower() for s in args.strategies.split(",")}
-    valid_strategies = {"color", "background", "noise"}
-    unknown = strategies - valid_strategies
-    if unknown:
-        print(f"Unknown strategies: {unknown}. Valid: {valid_strategies}", file=sys.stderr)
+    valid = {"color", "background", "noise"}
+    if unknown := strategies - valid:
+        print(f"Unknown strategies: {unknown}. Valid: {valid}", file=sys.stderr)
         sys.exit(1)
 
     print(f"\n{'='*60}")
@@ -194,121 +174,103 @@ def run(args: argparse.Namespace) -> None:
     print(f"  Dry run:     {args.dry_run}")
     print(f"{'='*60}\n")
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # 1. Load source dataset
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     print(f"[1/5] Loading source dataset: {args.source}")
     source = LeRobotDataset(args.source)
-    print(f"      {source.meta.total_episodes} episodes, {source.meta.total_frames} frames, {source.meta.fps} fps")
-
     image_keys = get_image_keys(source)
-    state_keys = get_state_keys(source)
-    print(f"      Image keys: {image_keys}")
-    print(f"      State keys: {state_keys}")
+    data_keys = get_data_keys(source)
+    n_eps = min(source.meta.total_episodes, args.max_episodes or source.meta.total_episodes)
+    ep_indices = list(range(n_eps))
+    print(f"      {source.meta.total_episodes} episodes total, processing {n_eps}")
+    print(f"      FPS: {source.meta.fps} | Images: {image_keys} | Data: {data_keys}")
 
-    # -----------------------------------------------------------------------
-    # 2. Load all episodes into memory (or stream, for large datasets)
-    # -----------------------------------------------------------------------
-    print(f"\n[2/5] Loading episodes (max={args.max_episodes or 'all'})...")
-    all_episodes = list(
-        tqdm(
-            iter_episodes(source, max_episodes=args.max_episodes),
-            total=min(source.meta.total_episodes, args.max_episodes or source.meta.total_episodes),
-            desc="  Loading",
-            unit="ep",
-        )
-    )
-    print(f"      Loaded {len(all_episodes)} episodes.")
-
-    # -----------------------------------------------------------------------
-    # 3. Quality filtering
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 2. Quality filtering (reads parquet only — no video decode)
+    # -------------------------------------------------------------------------
     if args.filter_quality:
-        print(f"\n[3/5] Scoring episode quality (action smoothness)...")
-        episodes_to_augment = filter_episodes(
-            all_episodes,
+        print(f"\n[2/5] Scoring episode quality (parquet action data, no video decode)...")
+        ep_indices = score_and_filter_episodes(
+            source, ep_indices,
             threshold=args.quality_threshold,
             verbose=True,
         )
+        if not ep_indices:
+            print("ERROR: No episodes passed quality filter. Lower --quality-threshold.",
+                  file=sys.stderr)
+            sys.exit(1)
     else:
-        print(f"\n[3/5] Skipping quality filter (use --filter-quality to enable).")
-        episodes_to_augment = all_episodes
+        print(f"\n[2/5] Skipping quality filter (pass --filter-quality to enable).")
 
-    if not episodes_to_augment:
-        print("ERROR: No episodes passed quality filter. Lower --quality-threshold.", file=sys.stderr)
-        sys.exit(1)
-
-    # -----------------------------------------------------------------------
-    # 4. Create output dataset and apply augmentations
-    # -----------------------------------------------------------------------
-    print(f"\n[4/5] Creating output dataset: {args.output}")
+    # -------------------------------------------------------------------------
+    # 3. Create output dataset
+    # -------------------------------------------------------------------------
+    print(f"\n[3/5] Creating output dataset schema: {args.output}")
     out_dataset = create_output_dataset(source, args.output)
-
     color_transform = build_color_transform() if "color" in strategies else None
 
-    total_episodes_out = len(episodes_to_augment) * args.multiplier
-    print(f"      Will create {total_episodes_out} augmented episodes "
-          f"({len(episodes_to_augment)} × {args.multiplier})\n")
+    total_out = len(ep_indices) * args.multiplier
+    print(f"      Will produce {total_out} episodes ({len(ep_indices)} source × {args.multiplier}x)\n")
 
-    ep_counter = 0
+    # -------------------------------------------------------------------------
+    # 4. Augment: stream frame-by-frame (constant memory regardless of dataset size)
+    # -------------------------------------------------------------------------
+    print(f"[4/5] Augmenting episodes...")
+    ep_out_count = 0
+
     for variant_idx in range(args.multiplier):
-        print(f"  Variant {variant_idx + 1}/{args.multiplier}:")
-        for orig_ep_idx, frames in tqdm(episodes_to_augment, desc="    Episodes", unit="ep"):
-            base_seed = variant_idx * 100_000 + orig_ep_idx * 1_000
+        desc = f"  Variant {variant_idx + 1}/{args.multiplier}"
+        for ep_idx in tqdm(ep_indices, desc=desc, unit="ep"):
+            start, end = get_episode_bounds(source, ep_idx)
+            base_seed = variant_idx * 100_000 + ep_idx * 1_000
 
-            for frame_offset, frame in enumerate(frames):
-                seed = base_seed + frame_offset
-                aug_frame = augment_frame(
+            for frame_offset, global_idx in enumerate(range(start, end)):
+                frame = source[global_idx]
+                aug = augment_frame(
                     frame=frame,
                     strategies=strategies,
                     image_keys=image_keys,
-                    state_keys=state_keys,
-                    seed=seed,
+                    data_keys=data_keys,
+                    seed=base_seed + frame_offset,
                     color_transform=color_transform,
                     state_noise_scale=args.state_noise_scale,
                     action_noise_scale=args.action_noise_scale,
+                    source_features=source.meta.features,
                 )
-                out_dataset.add_frame(aug_frame)
+                out_dataset.add_frame(aug)
 
             out_dataset.save_episode()
-            ep_counter += 1
+            ep_out_count += 1
 
-    print(f"\n  Done. Created {ep_counter} episodes.")
+    print(f"\n  Done. Created {ep_out_count} augmented episodes.")
 
-    # -----------------------------------------------------------------------
-    # 5. Finalize and upload
-    # -----------------------------------------------------------------------
-    print(f"\n[5/5] Finalizing dataset...")
+    # -------------------------------------------------------------------------
+    # 5. Finalize and push
+    # -------------------------------------------------------------------------
+    print(f"\n[5/5] Finalizing...")
     out_dataset.finalize()
     print("      finalize() complete.")
 
     if args.dry_run:
-        print("\n  DRY RUN — skipping upload.")
+        print(f"\n  DRY RUN — skipping upload.")
         print(f"  Dataset saved locally at: {out_dataset.root}")
         return
 
-    print(f"  Uploading to HuggingFace Hub as '{args.output}' ...")
-    out_dataset.push_to_hub(
-        push_videos=True,
-        private=args.private,
-        license="apache-2.0",
-    )
+    print(f"  Uploading '{args.output}' to HuggingFace Hub...")
+    out_dataset.push_to_hub(push_videos=True, private=args.private, license="apache-2.0")
 
-    # Print visualizer link
-    hf_user = args.output.split("/")[0]
-    dataset_name = args.output.split("/")[1]
-    visualizer_url = (
+    hf_user, dataset_name = args.output.split("/", 1)
+    vis_url = (
         f"https://huggingface.co/spaces/lerobot/visualize_dataset"
         f"?path=%2F{hf_user}%2F{dataset_name}%2Fepisode_0"
     )
     print(f"\n{'='*60}")
     print(f"  Upload complete!")
-    print(f"  Dataset: https://huggingface.co/datasets/{args.output}")
-    print(f"\n  Visualizer link:")
-    print(f"  {visualizer_url}")
+    print(f"  Dataset:    https://huggingface.co/datasets/{args.output}")
+    print(f"  Visualizer: {vis_url}")
     print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    run(args)
+    run(parse_args())
