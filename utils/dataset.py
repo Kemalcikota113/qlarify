@@ -73,7 +73,7 @@ def create_output_dataset(
     from huggingface_hub import constants as hf_constants
     import pathlib
 
-    local_dir = pathlib.Path(hf_constants.HF_HOME) / "lerobot" / repo_id.replace("/", "--")
+    local_dir = pathlib.Path(hf_constants.HF_HOME) / "lerobot" / repo_id
     if local_dir.exists():
         if overwrite:
             shutil.rmtree(local_dir)
