@@ -1,6 +1,18 @@
-"""Episode quality scoring and filtering based on action smoothness."""
+"""Multi-dimensional episode quality scoring and filtering.
+
+Produces a QualityReport per episode covering three axes:
+  1. Kinematic Smoothness — jerk (2nd derivative) of action sequence
+  2. Idle Detection       — fraction of frames with near-zero joint velocity
+  3. Length Outlier       — episodes ±2σ from the dataset mean length
+
+The overall_score combines smoothness and idle penalty and is used for
+filtering. Length outlier status is printed but does not affect the score
+(it is informational — very short/long episodes may still be valid).
+"""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -8,27 +20,72 @@ import torch
 from utils.dataset import load_all_actions_by_episode
 
 
-def score_episode_actions(actions: torch.Tensor) -> float:
-    """Score an episode's quality by action smoothness (lower jerk = higher quality).
+@dataclass
+class QualityReport:
+    smoothness: float       # jerk-based [0,1], higher = smoother
+    idle_ratio: float       # fraction of frames with near-zero velocity [0,1]
+    is_length_outlier: bool # True if episode length is ±2σ from mean
+    overall_score: float    # combined score used for filtering [0,1]
+    episode_length: int     # number of frames in episode
 
-    Uses the second derivative (jerk) of the action sequence. Smooth,
-    purposeful robot motion produces low jerk. Trembling or failed grasps
-    produce high jerk.
+
+def score_episode_multidim(
+    actions: torch.Tensor,
+    episode_length: int,
+    mean_length: float,
+    std_length: float,
+    idle_velocity_threshold: float = 0.001,
+    idle_penalty_above: float = 0.15,
+) -> QualityReport:
+    """Compute a multi-dimensional quality report for a single episode.
 
     Args:
         actions: Tensor of shape (T, D), float32.
+        episode_length: Number of frames (== T).
+        mean_length: Mean episode length across the dataset.
+        std_length: Std dev of episode lengths (if 0, outlier check is skipped).
+        idle_velocity_threshold: Per-frame mean joint speed below which a frame
+            is considered idle (near-zero motion).
+        idle_penalty_above: idle_ratio values above this trigger a score penalty.
 
     Returns:
-        Float in [0, 1], higher = smoother/better quality.
-        Returns 1.0 if episode is too short to compute jerk (< 3 frames).
+        QualityReport with all metrics filled in.
     """
-    if actions.shape[0] < 3:
-        return 1.0
+    a = actions.numpy()  # (T, D)
 
-    a = actions.numpy()
-    jerk = np.diff(a, n=2, axis=0)  # (T-2, D)
-    mean_abs_jerk = float(np.mean(np.abs(jerk)))
-    return 1.0 / (1.0 + mean_abs_jerk)
+    # --- Kinematic smoothness (jerk = 2nd derivative) ---
+    if a.shape[0] >= 3:
+        jerk = np.diff(a, n=2, axis=0)
+        smoothness = float(1.0 / (1.0 + np.mean(np.abs(jerk))))
+    else:
+        smoothness = 1.0
+
+    # --- Idle detection (velocity = 1st derivative) ---
+    if a.shape[0] >= 2:
+        velocity = np.diff(a, n=1, axis=0)          # (T-1, D)
+        per_frame_speed = np.mean(np.abs(velocity), axis=1)  # (T-1,)
+        idle_ratio = float(np.mean(per_frame_speed < idle_velocity_threshold))
+    else:
+        idle_ratio = 0.0
+
+    # --- Length outlier (±2σ from dataset mean) ---
+    if std_length > 0:
+        z = abs(episode_length - mean_length) / std_length
+        is_length_outlier = z > 2.0
+    else:
+        is_length_outlier = False
+
+    # --- Overall score: smoothness penalised by excess idle ratio ---
+    idle_excess = max(0.0, idle_ratio - idle_penalty_above)
+    overall_score = float(np.clip(smoothness * (1.0 - idle_excess * 2.0), 0.0, 1.0))
+
+    return QualityReport(
+        smoothness=smoothness,
+        idle_ratio=idle_ratio,
+        is_length_outlier=is_length_outlier,
+        overall_score=overall_score,
+        episode_length=episode_length,
+    )
 
 
 def score_and_filter_episodes(
@@ -36,20 +93,21 @@ def score_and_filter_episodes(
     ep_indices: list[int],
     threshold: float = 0.3,
     verbose: bool = True,
+    report_only: bool = False,
 ) -> list[int]:
-    """Score episodes from parquet action data and return indices above threshold.
+    """Score episodes and return indices whose overall_score >= threshold.
 
-    Loads each parquet shard once (not once per episode), then groups by
-    episode. No video decoding — fast even for large datasets.
+    Loads each parquet shard once (no video decoding) for fast scoring.
 
     Args:
         dataset: Source LeRobotDataset.
-        ep_indices: Episode indices to score.
-        threshold: Minimum smoothness score to keep [0, 1].
-        verbose: Print per-episode scores.
+        ep_indices: Episode indices to evaluate.
+        threshold: Minimum overall_score to keep [0, 1].
+        verbose: Print per-episode report table.
+        report_only: If True, print scores but keep ALL episodes (no filtering).
 
     Returns:
-        List of episode indices that passed the quality filter.
+        Filtered list of episode indices.
     """
     if verbose:
         print("  Loading action data from parquet (no video decode)...")
@@ -60,20 +118,56 @@ def score_and_filter_episodes(
             print(f"  Warning: could not load actions ({e}), keeping all episodes.")
         return list(ep_indices)
 
-    kept = []
+    # Compute episode lengths for outlier detection
+    ep_lengths = []
     for ep_idx in ep_indices:
+        ep_row = dataset.meta.episodes[ep_idx]
+        ep_lengths.append(int(ep_row["dataset_to_index"]) - int(ep_row["dataset_from_index"]))
+    mean_length = float(np.mean(ep_lengths)) if ep_lengths else 0.0
+    std_length = float(np.std(ep_lengths)) if len(ep_lengths) > 1 else 0.0
+
+    if verbose:
+        header = (
+            f"  {'Ep':>3}  {'smooth':>7}  {'idle':>6}  {'length':>7}  {'overall':>8}  decision"
+        )
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+
+    kept = []
+    for ep_idx, ep_length in zip(ep_indices, ep_lengths):
         ep_row = dataset.meta.episodes[ep_idx]
         ep_index = int(ep_row["episode_index"])
         actions = actions_by_ep.get(ep_index)
-        score = score_episode_actions(actions) if actions is not None else 1.0
-        status = "KEEP" if score >= threshold else "DROP"
+
+        if actions is not None:
+            report = score_episode_multidim(
+                actions, ep_length, mean_length, std_length
+            )
+        else:
+            report = QualityReport(
+                smoothness=1.0, idle_ratio=0.0,
+                is_length_outlier=False, overall_score=1.0,
+                episode_length=ep_length,
+            )
+
+        decision = "KEEP" if (report_only or report.overall_score >= threshold) else "DROP"
+        outlier_tag = " [OUTLIER]" if report.is_length_outlier else ""
+
         if verbose:
-            print(f"  Episode {ep_idx:3d}: smoothness={score:.4f} [{status}]")
-        if score >= threshold:
+            print(
+                f"  {ep_idx:>3}  "
+                f"{report.smoothness:>7.4f}  "
+                f"{report.idle_ratio:>6.3f}  "
+                f"{report.episode_length:>7}{outlier_tag:<10}  "
+                f"{report.overall_score:>7.4f}  "
+                f"{decision}"
+            )
+
+        if report_only or report.overall_score >= threshold:
             kept.append(ep_idx)
 
     if verbose:
-        print(f"\n  Quality filter: kept {len(kept)}/{len(ep_indices)} episodes "
-              f"(threshold={threshold})")
+        action = "reported" if report_only else f"kept {len(kept)}/{len(ep_indices)}"
+        print(f"\n  Quality filter: {action} (threshold={threshold})")
 
     return kept

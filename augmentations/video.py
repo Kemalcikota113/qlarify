@@ -95,43 +95,83 @@ def _pil_to_tensor(pil_image: Image.Image) -> torch.Tensor:
     return torch.from_numpy(img_np).permute(2, 0, 1)
 
 
+def build_gradient_background(
+    size: tuple[int, int],
+    seed: int | None = None,
+) -> Image.Image:
+    """Create a random vertical linear gradient RGBA background image.
+
+    Picks two random muted RGB colors and interpolates linearly from top to
+    bottom, producing varied but visually clean backgrounds for spatial
+    domain randomization.
+
+    Args:
+        size: (width, height) of the output image.
+        seed: RNG seed for reproducibility.
+
+    Returns:
+        RGBA PIL Image (alpha=255 everywhere) of the given size.
+    """
+    rng = np.random.default_rng(seed)
+    color_top = rng.integers(50, 200, size=3)
+    color_bot = rng.integers(50, 200, size=3)
+
+    width, height = size
+    gradient = np.zeros((height, width, 4), dtype=np.uint8)
+    for y in range(height):
+        t = y / max(height - 1, 1)
+        rgb = ((1 - t) * color_top + t * color_bot).round().astype(np.uint8)
+        gradient[y, :, :3] = rgb
+        gradient[y, :, 3] = 255  # fully opaque
+
+    return Image.fromarray(gradient, mode="RGBA")
+
+
 def replace_background(
     image_tensor: torch.Tensor,
     bg_color: tuple[int, int, int] | None = None,
+    bg_style: str = "random",
     seed: int | None = None,
 ) -> torch.Tensor:
-    """Remove background with rembg and composite onto a random solid color.
+    """Remove background with rembg and composite onto a generated background.
 
-    This implements domain randomization: the robot arm is kept but the
-    workspace background is replaced with a new color, forcing the model
-    to focus on the robot rather than background cues.
+    Implements spatial domain randomization: the robot arm foreground is
+    preserved while the workspace background is replaced, preventing the
+    policy from learning background-specific shortcuts.
 
     Args:
         image_tensor: Float32 CHW [0, 1] tensor.
-        bg_color: RGB tuple for background. Random if None.
-        seed: RNG seed for reproducible background color selection.
+        bg_color: Fixed RGB color for solid background (random if None).
+        bg_style: "solid" | "gradient" | "random" (50/50 solid vs gradient).
+        seed: RNG seed for reproducible background generation.
 
     Returns:
         Augmented float32 CHW [0, 1] tensor with replaced background.
     """
     from rembg import remove
 
-    if seed is not None:
-        np.random.seed(seed)
+    rng = np.random.default_rng(seed)
 
     session = _get_rembg_session()
     pil_img = _tensor_to_pil(image_tensor)
 
-    # Remove background → RGBA image with transparent background
+    # Remove background → RGBA with transparent background
     fg_rgba = remove(pil_img, session=session)
 
-    # Choose random background color (avoiding very dark or very light)
-    if bg_color is None:
-        bg_color = tuple(np.random.randint(60, 200, 3).tolist())
+    # Choose background type
+    use_gradient = (
+        bg_style == "gradient"
+        or (bg_style == "random" and rng.random() > 0.5)
+    )
 
-    background = Image.new("RGBA", pil_img.size, bg_color + (255,))
+    if use_gradient:
+        background = build_gradient_background(pil_img.size, seed=int(rng.integers(0, 2**31)))
+    else:
+        if bg_color is None:
+            bg_color = tuple(rng.integers(60, 200, size=3).tolist())
+        background = Image.new("RGBA", pil_img.size, bg_color + (255,))
+
     composite = Image.alpha_composite(background, fg_rgba).convert("RGB")
-
     return _pil_to_tensor(composite)
 
 
@@ -145,6 +185,7 @@ def augment_image(
     seed: int | None = None,
     color_transform: T.Compose | None = None,
     bg_color: tuple[int, int, int] | None = None,
+    bg_style: str = "random",
 ) -> torch.Tensor:
     """Apply requested augmentation strategies to a single camera frame.
 
@@ -153,7 +194,8 @@ def augment_image(
         strategies: Set of strategy names: {"color", "background"}.
         seed: RNG seed (use different seeds per episode variant).
         color_transform: Pre-built color transform for reuse.
-        bg_color: Fixed background color override (random if None).
+        bg_color: Fixed background color override for solid backgrounds.
+        bg_style: "solid" | "gradient" | "random" for background style.
 
     Returns:
         Augmented float32 CHW [0, 1] tensor.
@@ -161,7 +203,7 @@ def augment_image(
     result = image_tensor
 
     if "background" in strategies:
-        result = replace_background(result, bg_color=bg_color, seed=seed)
+        result = replace_background(result, bg_color=bg_color, bg_style=bg_style, seed=seed)
 
     if "color" in strategies:
         result = color_augment(result, seed=seed, transform=color_transform)
