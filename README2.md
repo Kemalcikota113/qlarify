@@ -309,11 +309,11 @@ Here is the full user story flow from clone to visualizer, as a first-time user 
 
 **1. Installing and cloning the repo**
 ![install](images/install.png)
-`git clone` + `uv sync` — dependencies resolve from the frozen lock file in under two minutes.
+`git clone` + `uv sync` - dependencies resolve from the frozen lock file in under two minutes.
 
 **2. Running the quality report**
 ![dry-run-output](images/dry-run-output.png)
-The rich summary table prints immediately, followed by the per-episode quality report — smoothness, idle ratio, and overall score for each episode, no video decode needed.
+The rich summary table prints immediately, followed by the per-episode quality report, smoothness, idle ratio, and overall score for each episode, no video decode needed.
 
 **3. Full augmentation pipeline running**
 ![upload-step3](images/upload-step3.png)
@@ -325,14 +325,14 @@ Episode 0 joint state and action traces in the HuggingFace visualizer. The smoot
 
 **5. Augmented dataset — spatial domain randomization visible**
 ![visualization-ep2](images/visualization-ep2.png)
-All four camera streams for an episode where background replacement was applied. The robot arm is cleanly composited onto a solid green background — the rembg U2Net segmentation working correctly on real hardware footage.
+All four camera streams for an episode where background replacement was applied. The robot arm is cleanly composited onto a solid green background, the rembg U2Net segmentation working correctly on real hardware footage.
 
 **6. Augmented dataset — action graphs, later episode**
 ![visualization-ep3](images/visualization-ep3.png)
-A different episode's state/action traces. The action profiles are structurally similar to the originals but offset by noise injection — the perturbation is present but small enough to preserve task validity.
+A different episode's state/action traces. The action profiles are structurally similar to the originals but offset by noise injection, the perturbation is present but small enough to preserve task validity.
 
 **7. Augmented dataset — dark background variant**
 ![visualization-ep4](images/visualization-ep4.png)
-Episode 5 with a different synthetic background. Comparing this with screenshot 5 shows the background diversity across episodes — solid colors varying per episode, which is the intended behaviour of spatial domain randomization.
+Episode 5 with a different synthetic background. Comparing this with screenshot 5 shows the background diversity across episodes, solid colors varying per episode, which is the intended behaviour of spatial domain randomization.
 
 ![images]()
