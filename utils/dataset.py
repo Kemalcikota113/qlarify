@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -58,8 +59,31 @@ def load_all_actions_by_episode(dataset: LeRobotDataset) -> dict[int, torch.Tens
 def create_output_dataset(
     source: LeRobotDataset,
     repo_id: str,
+    overwrite: bool = False,
 ) -> LeRobotDataset:
-    """Create a new empty dataset mirroring the source's schema."""
+    """Create a new empty dataset mirroring the source's schema.
+
+    Args:
+        source: Source dataset to mirror schema from.
+        repo_id: Output HuggingFace repo ID (e.g. ``user/dataset-name``).
+        overwrite: If True, delete any existing local cache for ``repo_id``
+            before creating. If False and the cache exists, raises a clear
+            error rather than letting LeRobotDataset raise a cryptic one.
+    """
+    from huggingface_hub import constants as hf_constants
+    import pathlib
+
+    local_dir = pathlib.Path(hf_constants.HF_HOME) / "lerobot" / repo_id.replace("/", "--")
+    if local_dir.exists():
+        if overwrite:
+            shutil.rmtree(local_dir)
+        else:
+            raise FileExistsError(
+                f"Local cache already exists for '{repo_id}' at {local_dir}.\n"
+                "Re-run with --overwrite to delete it and start fresh, "
+                "or choose a different --output name."
+            )
+
     return LeRobotDataset.create(
         repo_id=repo_id,
         fps=source.meta.fps,

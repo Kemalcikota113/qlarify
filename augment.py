@@ -20,11 +20,25 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
 import torch
+import torchvision.transforms.v2 as T
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from rich.console import Console
+from rich.table import Table
+from rich import box
 from tqdm import tqdm
+
+_console = Console()
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
 
 from augmentations.quality import score_and_filter_episodes
 from augmentations.state import augment_action, augment_state
@@ -115,6 +129,10 @@ def parse_args() -> argparse.Namespace:
         "--dry-run", action="store_true",
         help="Process data but skip upload. Always test with this first.",
     )
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Delete existing local cache for --output before starting (idempotent re-runs).",
+    )
     return parser.parse_args()
 
 
@@ -137,7 +155,7 @@ def augment_frame(
     image_keys: list[str],
     data_keys: list[str],
     seed: int,
-    color_transform,
+    color_transform: T.Compose | None,
     state_noise_scale: float,
     action_noise_scale: float,
     source_features: dict,
@@ -181,50 +199,65 @@ def augment_frame(
     return result
 
 
+def _print_summary(args: argparse.Namespace, strategies: set[str]) -> None:
+    """Print a rich-formatted Augmentation Summary table."""
+    table = Table(
+        title="[bold cyan]qlarify — Augmentation Summary[/bold cyan]",
+        box=box.ROUNDED,
+        show_header=False,
+        min_width=60,
+    )
+    table.add_column("Key", style="bold green", no_wrap=True)
+    table.add_column("Value", style="white")
+
+    table.add_row("Source Dataset", args.source)
+    table.add_row("Target Repo", args.output)
+    table.add_row("Strategies", ", ".join(sorted(strategies)))
+    table.add_row("Multiplier", f"{args.multiplier}x")
+    table.add_row("Max Episodes", str(args.max_episodes or "all"))
+
+    if "background" in strategies:
+        table.add_row("Background Style", args.bg_style)
+    if "tempo" in strategies:
+        table.add_row("Speed Range", f"{args.speed_min}x – {args.speed_max}x")
+    if args.filter_quality:
+        table.add_row("Quality Filter", f"ON  (threshold ≥ {args.quality_threshold})")
+    if args.quality_report_only:
+        table.add_row("Mode", "[yellow]quality report only[/yellow]")
+    table.add_row("Dry Run", "[yellow]yes[/yellow]" if args.dry_run else "[green]no[/green]")
+
+    _console.print()
+    _console.print(table)
+    _console.print()
+
+
 def run(args: argparse.Namespace) -> None:
     strategies = {s.strip().lower() for s in args.strategies.split(",")}
     valid = {"color", "background", "noise", "tempo"}
     if unknown := strategies - valid:
-        print(f"Unknown strategies: {unknown}. Valid: {valid}", file=sys.stderr)
+        log.error("Unknown strategies: %s. Valid: %s", unknown, valid)
         sys.exit(1)
 
-    print(f"\n{'='*60}")
-    print(f"  LeRobot Dataset Augmentation Tool")
-    print(f"{'='*60}")
-    print(f"  Source:       {args.source}")
-    print(f"  Output:       {args.output}")
-    print(f"  Strategies:   {', '.join(sorted(strategies))}")
-    print(f"  Multiplier:   {args.multiplier}x")
-    print(f"  Max episodes: {args.max_episodes or 'all'}")
-    if args.quality_report_only:
-        print(f"  Mode:         quality report only (no augmentation)")
-    elif args.filter_quality:
-        print(f"  Quality filter: ON (threshold={args.quality_threshold})")
-    if "background" in strategies:
-        print(f"  BG style:     {args.bg_style}")
-    if "tempo" in strategies:
-        print(f"  Speed range:  {args.speed_min}x – {args.speed_max}x")
-    print(f"  Dry run:      {args.dry_run}")
-    print(f"{'='*60}\n")
+    _print_summary(args, strategies)
 
     # -------------------------------------------------------------------------
     # 1. Load source dataset
     # -------------------------------------------------------------------------
-    print(f"[1/5] Loading source dataset: {args.source}")
+    log.info("[1/5] Loading source dataset: %s", args.source)
     source = LeRobotDataset(args.source)
     image_keys = get_image_keys(source)
     data_keys = get_data_keys(source)
     n_eps = min(source.meta.total_episodes, args.max_episodes or source.meta.total_episodes)
     ep_indices = list(range(n_eps))
-    print(f"      {source.meta.total_episodes} episodes total, processing {n_eps}")
-    print(f"      FPS: {source.meta.fps} | Images: {image_keys} | Data: {data_keys}")
+    log.info("      %d episodes total, processing %d", source.meta.total_episodes, n_eps)
+    log.info("      FPS: %s | Images: %s | Data: %s", source.meta.fps, image_keys, data_keys)
 
     # -------------------------------------------------------------------------
     # 2. Quality scoring / filtering
     # -------------------------------------------------------------------------
     if args.quality_report_only or args.filter_quality:
         label = "report" if args.quality_report_only else "filter"
-        print(f"\n[2/5] Multi-dimensional quality {label} (parquet, no video decode)...")
+        log.info("[2/5] Multi-dimensional quality %s (parquet, no video decode)...", label)
         ep_indices = score_and_filter_episodes(
             source, ep_indices,
             threshold=args.quality_threshold,
@@ -232,29 +265,28 @@ def run(args: argparse.Namespace) -> None:
             report_only=args.quality_report_only,
         )
         if args.quality_report_only:
-            print("\n  Report complete. Exiting (--quality-report-only).")
+            log.info("Report complete. Exiting (--quality-report-only).")
             return
         if not ep_indices:
-            print("ERROR: No episodes passed quality filter. Lower --quality-threshold.",
-                  file=sys.stderr)
+            log.error("No episodes passed quality filter. Lower --quality-threshold.")
             sys.exit(1)
     else:
-        print(f"\n[2/5] Skipping quality filter (pass --filter-quality to enable).")
+        log.info("[2/5] Skipping quality filter (pass --filter-quality to enable).")
 
     # -------------------------------------------------------------------------
     # 3. Create output dataset
     # -------------------------------------------------------------------------
-    print(f"\n[3/5] Creating output dataset schema: {args.output}")
-    out_dataset = create_output_dataset(source, args.output)
+    log.info("[3/5] Creating output dataset schema: %s", args.output)
+    out_dataset = create_output_dataset(source, args.output, overwrite=args.overwrite)
     color_transform = build_color_transform() if "color" in strategies else None
 
     total_out = len(ep_indices) * args.multiplier
-    print(f"      Will produce {total_out} episodes ({len(ep_indices)} source × {args.multiplier}x)\n")
+    log.info("      Will produce %d episodes (%d source × %dx)", total_out, len(ep_indices), args.multiplier)
 
     # -------------------------------------------------------------------------
     # 4. Augment — stream frame-by-frame (constant memory)
     # -------------------------------------------------------------------------
-    print(f"[4/5] Augmenting episodes...")
+    log.info("[4/5] Augmenting episodes...")
     ep_out_count = 0
     # Track how many source episodes have had background applied
     bg_ep_count = 0
@@ -306,21 +338,25 @@ def run(args: argparse.Namespace) -> None:
             out_dataset.save_episode()
             ep_out_count += 1
 
-    print(f"\n  Done. Created {ep_out_count} augmented episodes.")
+    log.info("Done. Created %d augmented episodes.", ep_out_count)
 
     # -------------------------------------------------------------------------
     # 5. Finalize and push
     # -------------------------------------------------------------------------
-    print(f"\n[5/5] Finalizing...")
-    out_dataset.finalize()
-    print("      finalize() complete.")
+    log.info("[5/5] Finalizing...")
+    try:
+        out_dataset.finalize()
+        log.info("      finalize() complete.")
+    except Exception:
+        log.exception("finalize() failed — dataset may be incomplete.")
+        raise
 
     if args.dry_run:
-        print(f"\n  DRY RUN — skipping upload.")
-        print(f"  Dataset saved locally at: {out_dataset.root}")
+        log.info("DRY RUN — skipping upload.")
+        log.info("Dataset saved locally at: %s", out_dataset.root)
         return
 
-    print(f"  Uploading '{args.output}' to HuggingFace Hub...")
+    log.info("Uploading '%s' to HuggingFace Hub...", args.output)
     out_dataset.push_to_hub(push_videos=True, private=args.private, license="apache-2.0")
 
     hf_user, dataset_name = args.output.split("/", 1)
@@ -328,12 +364,16 @@ def run(args: argparse.Namespace) -> None:
         f"https://huggingface.co/spaces/lerobot/visualize_dataset"
         f"?path=%2F{hf_user}%2F{dataset_name}%2Fepisode_0"
     )
-    print(f"\n{'='*60}")
-    print(f"  Upload complete!")
-    print(f"  Dataset:    https://huggingface.co/datasets/{args.output}")
-    print(f"  Visualizer: {vis_url}")
-    print(f"{'='*60}\n")
+    log.info("=" * 60)
+    log.info("  Upload complete!")
+    log.info("  Dataset:    https://huggingface.co/datasets/%s", args.output)
+    log.info("  Visualizer: %s", vis_url)
+    log.info("=" * 60)
+
+
+def main() -> None:
+    run(parse_args())
 
 
 if __name__ == "__main__":
-    run(parse_args())
+    main()

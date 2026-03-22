@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from utils.dataset import load_all_actions_by_episode
 
@@ -89,7 +90,7 @@ def score_episode_multidim(
 
 
 def score_and_filter_episodes(
-    dataset,
+    dataset: LeRobotDataset,
     ep_indices: list[int],
     threshold: float = 0.3,
     verbose: bool = True,
