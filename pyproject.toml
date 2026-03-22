@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qlarify"
+version = "0.1.0"
+description = "LeRobot v3 dataset augmentation tool — photometric, spatial, and temporal domain randomization for robot learning policies."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Kemal Cikota" }]
+
+dependencies = [
+    "lerobot>=0.4.0",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "rembg>=2.0.50",
+    "opencv-python-headless>=4.8.0",
+    "pillow>=10.0.0",
+    "tqdm>=4.65.0",
+    "rich>=13.0.0",
+    "huggingface_hub>=0.20.0",
+    "numpy>=1.24.0",
+    "onnxruntime>=1.16.0",
+]
+
+[project.scripts]
+qlarify = "augment:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["augmentations", "utils"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
