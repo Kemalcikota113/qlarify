@@ -91,6 +91,15 @@ def parse_args() -> argparse.Namespace:
         help="Background style for spatial domain randomization. Default: random",
     )
     parser.add_argument(
+        "--background-episodes", type=int, default=None,
+        help=(
+            "Limit background replacement to the first N source episodes. "
+            "Other episodes still get the remaining strategies. "
+            "Useful to cap rembg compute time while still demonstrating spatial "
+            "domain randomization in the visualizer."
+        ),
+    )
+    parser.add_argument(
         "--speed-min", type=float, default=0.75,
         help="Min speed factor for temporal domain randomization. Default: 0.75",
     )
@@ -247,6 +256,9 @@ def run(args: argparse.Namespace) -> None:
     # -------------------------------------------------------------------------
     print(f"[4/5] Augmenting episodes...")
     ep_out_count = 0
+    # Track how many source episodes have had background applied
+    bg_ep_count = 0
+    bg_limit = args.background_episodes  # None = unlimited
 
     for variant_idx in range(args.multiplier):
         desc = f"  Variant {variant_idx + 1}/{args.multiplier}"
@@ -254,10 +266,16 @@ def run(args: argparse.Namespace) -> None:
             start, end = get_episode_bounds(source, ep_idx)
             base_seed = variant_idx * 100_000 + ep_idx * 1_000
 
+            # Per-episode strategy set: drop background once limit is reached
+            ep_strategies = set(strategies)
+            if "background" in ep_strategies and bg_limit is not None:
+                if bg_ep_count >= bg_limit:
+                    ep_strategies = ep_strategies - {"background"}
+
             # Temporal domain randomization: resample frame sequence
             # source[global_idx] returns both video frame AND parquet row
             # as one dict — skipping an index skips both simultaneously.
-            if "tempo" in strategies:
+            if "tempo" in ep_strategies:
                 speed = sample_speed_factor(
                     seed=base_seed,
                     speed_min=args.speed_min,
@@ -271,7 +289,7 @@ def run(args: argparse.Namespace) -> None:
                 frame = source[global_idx]
                 aug = augment_frame(
                     frame=frame,
-                    strategies=strategies,
+                    strategies=ep_strategies,
                     image_keys=image_keys,
                     data_keys=data_keys,
                     seed=base_seed + frame_offset,
@@ -283,6 +301,8 @@ def run(args: argparse.Namespace) -> None:
                 )
                 out_dataset.add_frame(aug)
 
+            if "background" in ep_strategies:
+                bg_ep_count += 1
             out_dataset.save_episode()
             ep_out_count += 1
 

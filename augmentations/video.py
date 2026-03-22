@@ -73,7 +73,7 @@ def _get_rembg_session():
         try:
             from rembg import new_session
             print("  Loading rembg U2Net model (first-time download may take a moment)...")
-            _REMBG_SESSION = new_session("u2net")
+            _REMBG_SESSION = new_session("u2netp")  # pruned model, ~3× faster on CPU
             print("  rembg model loaded.")
         except ImportError:
             raise ImportError(
