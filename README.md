@@ -124,6 +124,12 @@ qlarify --help
 
 Start by inspecting the source data before touching anything:
 
+> **Prerequisite:** a HuggingFace write token must be set before any run that uploads.
+> ```bash
+> export HF_TOKEN=hf_your_token_here   # get one at https://huggingface.co/settings/tokens
+> ```
+> The token only needs to be set once per shell session. Use `--dry-run` to skip the upload entirely if you just want to test locally.
+
 ```bash
 # Step 1 — check episode quality before augmenting (fast, no video decode)
 qlarify \
