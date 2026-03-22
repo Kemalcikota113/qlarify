@@ -1,4 +1,4 @@
-# Qlarify — A LeRobot Dataset Augmentation Tool
+# Qlarify - A LeRobot Dataset Augmentation Tool
 
 Qlarify is a CLI tool that downloads a [LeRobot v3](https://huggingface.co/docs/lerobot/lerobot-dataset-v3) dataset from HuggingFace Hub, runs it through a multi-strategy augmentation pipeline, and pushes the result back to the Hub, ready to improve policy robustness on real hardware. It was built as part of a 6-hour coding challenge, with the goal of producing something that an ML engineer could actually drop into their workflow, not just a demo.
 
