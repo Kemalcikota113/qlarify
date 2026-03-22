@@ -63,18 +63,55 @@ The `overall_score = smoothness × (1 − max(0, idle_ratio − 0.15) × 2)` com
 
 ## Installation
 
+### Option A — Docker (recommended, zero environment friction)
+
+```bash
+git clone https://github.com/Kemalcikota113/qlarify
+cd qlarify
+
+# Generate the lock file (one-time, requires uv)
+uv lock
+
+# Build the image
+docker build -t qlarify .
+
+# Smoke test — quality report on 5 episodes, no upload
+docker run --rm \
+  -e HF_TOKEN=$HF_TOKEN \
+  qlarify \
+    --source lerobot/aloha_static_cups_open \
+    --output unused/unused \
+    --strategies color \
+    --max-episodes 5 \
+    --quality-report-only \
+    --dry-run
+```
+
+### Option B — uv (fast local development)
+
+```bash
+git clone https://github.com/Kemalcikota113/qlarify
+cd qlarify
+uv sync
+export HF_TOKEN=hf_...   # HuggingFace write token
+uv run qlarify --help
+```
+
+### Option C — pip / venv (classic)
+
 ```bash
 git clone https://github.com/Kemalcikota113/qlarify
 cd qlarify
 python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-export HF_TOKEN=hf_...   # HuggingFace write token
+pip install -e .
+export HF_TOKEN=hf_...
 ```
 
 ## Usage
 
 ```bash
-python augment.py \
+# After pip install -e . or uv sync
+qlarify \
   --source lerobot/aloha_static_cups_open \
   --output YOUR_HF_USER/aloha_augmented \
   --strategies color,background,noise,tempo \
@@ -140,31 +177,35 @@ utils/
 
 ## How I used AI coding agents to build this
 
-This tool was built almost entirely using **[Claude Code](https://claude.ai/code)** (Anthropic's CLI agent) as the primary development tool, in line with the challenge's explicit expectation of heavy AI agent usage.
+This tool was built using **[Claude Code](https://claude.ai/code)** (Anthropic's CLI agent) as the primary development partner, in line with the challenge's explicit expectation of heavy AI agent usage. The collaboration was genuinely architectural — Claude was not used for boilerplate generation but for reasoning about design decisions, surfacing non-obvious API contracts, and catching failure modes before they became runtime bugs.
 
-### Phase 1 — LeRobot v3 API exploration (delegated to Claude)
+### Phase 1 — LeRobot v3 API exploration
 
-The LeRobot v3 format was brand new and sparsely documented. I asked Claude Code to fetch and analyse the library source directly from GitHub, extracting the exact API contract for `add_frame()` / `save_episode()` / `finalize()`. Key facts it surfaced that would have taken significant manual effort to discover:
+The LeRobot v3 format was brand new and sparsely documented. I asked Claude Code to fetch and analyse the library source directly from GitHub, extracting the exact API contract for `add_frame()` / `save_episode()` / `finalize()`. Key facts surfaced that would have taken significant manual effort to discover:
 
-- `add_frame()` expects **HWC uint8**, not the CHW float32 tensors that `dataset[i]` returns — a silent shape mismatch that would have caused obscure failures.
-- `finalize()` must be called before `push_to_hub()` — without it, parquet file footers are never written and the dataset silently corrupts.
-- `dataset.meta.episodes` is a HuggingFace `Dataset` object, not a pandas DataFrame — the `.iloc` accessor I initially used would have crashed immediately.
+- `add_frame()` expects **HWC uint8**, not the CHW float32 tensors that `dataset[i]` returns — a silent type mismatch that would have caused obscure validation failures with no useful error message.
+- `finalize()` must be called before `push_to_hub()` — without it, parquet file footers are never written and the remote dataset silently corrupts.
+- `dataset.meta.episodes` is a HuggingFace `datasets.Dataset` object, not a pandas DataFrame — the `.iloc` accessor I initially used would have crashed immediately on indexing.
 
-### Phase 2 — Streaming architecture (Claude identified the OOM risk before it happened)
+### Phase 2 — Streaming architecture and memory safety
 
-My first implementation pre-loaded all frames of each episode into memory before augmenting. Claude flagged the memory arithmetic before I ran it: 400 frames × 4 cameras × 480×640 × float32 ≈ 5.5GB per episode. It proposed the streaming design — process one frame at a time, constant memory regardless of dataset size — which became the core architecture.
+My first implementation pre-loaded all frames of each episode into memory before augmenting. Claude flagged the memory arithmetic before I ran it: 400 frames × 4 cameras × 480×640 × float32 ≈ **5.5 GB per episode**. It proposed the streaming design — process one frame at a time, O(1) memory regardless of dataset size — which became the core architectural principle of the pipeline.
 
-### Phase 3 — Parquet-only quality scoring
+### Phase 3 — Kinematic Integrity via Parquet-only Quality Scoring
 
-For the quality filter, Claude proposed reading action columns directly from the parquet files using the HuggingFace `datasets` library, bypassing video decode entirely. This made the quality scoring 20–50× faster than the naive approach of calling `dataset[i]` for every frame.
+For the quality filter, Claude proposed reading action columns directly from the parquet shards using the HuggingFace `datasets` library, bypassing video decode entirely. The multi-dimensional scoring (kinematic smoothness via jerk analysis + idle detection via velocity thresholding + length outlier flagging) emerged from this conversation. Quality scoring runs 20–50× faster than the naive approach of calling `dataset[i]` for every frame.
 
-### Phase 4 — Temporal sync guarantee
+### Phase 4 — Temporal Domain Randomization and Sync Guarantees
 
-When designing temporal domain randomization, Claude identified that because `source[global_idx]` returns both video and kinematics as a single atomic dict, frame resampling is inherently synchronized — skipping frame index 5 skips both its video frame and its parquet row simultaneously. No separate alignment logic was needed.
+When designing Temporal Domain Randomization (control frequency robustness via frame resampling), Claude identified that because `source[global_idx]` returns both video and kinematics as a single atomic dict, resampling is inherently synchronized — skipping frame index 5 skips both its camera frame and its parquet row (state, action, timestamp) simultaneously. No separate alignment logic was needed, and this invariant is now documented explicitly in `augmentations/temporal.py`.
 
-### Phase 5 — Iterative debugging
+### Phase 5 — Spatial Domain Randomization via AI-Powered Segmentation
 
-Claude diagnosed every `add_frame()` validation error immediately from the traceback — including the CHW→HWC conversion, the `next.done` scalar reshape issue, and the `timestamp` key that must be omitted (it is auto-generated). Each fix took seconds rather than the minutes of API archaeology it would have required manually.
+The background replacement strategy (robot foreground isolation via rembg U2Net + procedural gradient/solid background synthesis) was designed and debugged end-to-end with Claude. It identified the `--background-episodes N` optimization to cap rembg compute time on CPU while still demonstrating spatial domain randomization in the visualizer output.
+
+### Phase 6 — Production hardening
+
+Final audit covered: idempotency (`--overwrite` flag + `FileExistsError` on stale cache), `try/except` around `finalize()` to prevent silent parquet corruption on mid-run failure, structured `logging` replacing bare `print()`, complete type annotations, and packaging via `pyproject.toml` + `uv` + multi-stage Docker for reproducible deployment.
 
 ---
 
